@@ -119,10 +119,10 @@ def main():
     Основная функция: загрузка данных, деконволюция, сохранение результата
     """
     # Параметры по умолчанию
-    input_file = "blurred.bmp"    # Размытое изображение
-    kernel_file = "kernel.bmp"    # Ядро размытия
+    input_file = "Test10.png"    # Размытое изображение
+    kernel_file = "psf_kernel.png"    # Ядро размытия
     output_file = "output.bmp"    # Выходной файл
-    noise_level = 0.00001         # Уровень шума (влияет на силу регуляризации)
+    noise_level = 0.1        # Уровень шума (влияет на силу регуляризации)
 
     # Проверка наличия файлов
     if not os.path.exists(input_file):
@@ -139,7 +139,7 @@ def main():
     print("Начало процесса деконволюции...")
     x_restored = deconvolve_tv(
         y, k,
-        num_iters=200,               # Количество итераций
+        num_iters=500,               # Количество итераций
         lambda_tv=(noise_level / 255)  # Параметр регуляризации
     )
     print("Деконволюция завершена!")
