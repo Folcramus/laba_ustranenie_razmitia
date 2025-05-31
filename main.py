@@ -1,153 +1,148 @@
 import os
 import numpy as np
 import cv2
-from scipy.signal import convolve2d
-from skimage.restoration import denoise_tv_chambolle
+import threading
+import time
+import torch
+import torch.nn.functional as F
 
 
 def load_gray_image(path):
-    """
-    Загрузка изображения в градациях серого и преобразование к типу float64
-    Args:
-        path: Путь к файлу изображения
-    Returns:
-        Изображение в градациях серого (float64)
-    Raises:
-        ValueError: Если изображение не удалось загрузить
-    """
-    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)  # Чтение в оттенках серого
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         raise ValueError(f"Не удалось загрузить изображение: {path}")
-    # Конвертация в float64 для точных вычислений
-    return img.astype(np.float64)
+    return img.astype(np.float32) / 255.0
 
 
 def normalize_kernel(kernel):
-    """
-    Нормализация ядра размытия - сумма значений должна быть равна 1
-    Args:
-        kernel: Ядро размытия (матрица)
-    Returns:
-        Нормализованное ядро
-    """
     kernel_sum = np.sum(kernel)
-    # Деление на сумму или исходное ядро
     return kernel / kernel_sum if kernel_sum != 0 else kernel
 
 
 def psnr(target, ref):
-    """
-    Вычисление Peak Signal-to-Noise Ratio (PSNR) между двумя изображениями
-    Args:
-        target: Восстановленное изображение
-        ref: Эталонное изображение
-    Returns:
-        Значение PSNR в децибелах (dB)
-    """
-    mse = np.mean((target - ref) ** 2)  # Среднеквадратичная ошибка
+    mse = torch.mean((target - ref) ** 2)
     if mse == 0:
-        return float("inf")  # Бесконечность если изображения идентичны
-    PIXEL_MAX = 255.0  # Максимальное значение пикселя
-    return 20 * np.log10(PIXEL_MAX / np.sqrt(mse))  # Формула PSNR
+        return float("inf")
+    return 20 * torch.log10(torch.tensor(1.0) / torch.sqrt(mse))
 
 
-def deconvolve_tv(y, k, num_iters=100, lambda_tv=0.1):
-    """
-    Метод деконволюции с Total Variation (TV) регуляризацией
-    Args:
-        y: Размытое изображение (наблюдение)
-        k: Ядро размытия
-        num_iters: Количество итераций (по умолчанию 100)
-        lambda_tv: Параметр регуляризации (по умолчанию 0.1)
-    Returns:
-        Восстановленное изображение
-    """
-    # Отражение ядра по вертикали и горизонтали необходимо для корректного
-    # вычисления градиента (эквивалент операции транспонирования)
-    # Это нужно потому, что свертка с отраженным ядром - это сопряжённый оператор
-    k_flip = np.flipud(np.fliplr(k))
+def total_variation(x):
+    # TV регуляризация: сумма разностей между соседними пикселями по горизонтали и вертикали
+    tv_h = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :]).sum()
+    tv_w = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1]).sum()
+    return tv_h + tv_w
 
-    # В качестве начального приближения берем само размытое изображение
-    x = y.copy()
+
+def tikhonov_regularization(x):
+    # Регуляризация Тихонова: ||x||^2 = сумма квадратов значений
+    return torch.sum(x ** 2)
+
+
+def deconvolve_pytorch(y_np, k_np, method="TV", num_iters=300, lambda_reg=0.001, alpha=0.5, gamma=0.9, tol=1e-4, device='cuda', tv_interval=3, result_dict=None, key=None):
+    # Перевод изображений и ядра в тензоры PyTorch
+    y = torch.from_numpy(y_np).to(device).unsqueeze(0).unsqueeze(0)
+    k = torch.from_numpy(k_np).to(device).unsqueeze(0).unsqueeze(0)
+    k_flip = torch.flip(k, [2, 3])
+
+    x = y.clone().detach().requires_grad_(True)
+    v = torch.zeros_like(x)
+    prev_x = x.clone()
+
+    start = time.time()
 
     for i in range(num_iters):
-        print(f"Итерация {i+1}/{num_iters}")
-
-        # 1.1. Прямая операция (имитация размытия)
-        # -------------------------------------------------
-        # Вычисляем, как выглядело бы текущее восстановленное изображение x,
-        # если бы его размыли ядром k
-        # boundary='symm' - симметричное продолжение границ для уменьшения артефактов
-        conv_x = convolve2d(x, k, mode='same', boundary='symm')
-
-        # 1.2. Вычисление невязки (ошибки реконструкции)
-        # -------------------------------------------------
-        # Разница между смоделированным размытием и реальным размытым изображением
-
+        # Шаг восстановления с помощью свёртки и градиентного спуска
+        conv_x = F.conv2d(x, k, padding='same')
         residual = conv_x - y
+        grad_data = F.conv2d(residual, k_flip, padding='same')
 
-        # 1.3. Обратное распространение ошибки
-        # -------------------------------------------------
-        # Вычисление градиента функции потерь относительно x
-        # Эквивалентно умножению на сопряженный оператор (k^T)
-        grad_data = convolve2d(residual, k_flip, mode='same', boundary='symm')
+        # Адаптивный шаг градиентного спуска (метод Нестерова)
+        v = gamma * v + alpha * grad_data
+        x = x - v
+        x = torch.clamp(x, 0.0, 1.0)
 
-        # 1.4. Градиентный спуск
-        # -------------------------------------------------
-        # Обновление текущей оценки в направлении, уменьшающем ошибку
-        # Изменить на метод Нестерова
-        x = x - 0.1 * grad_data
+        # Применение регуляризации в зависимости от метода
+        if method == "TV" and i % tv_interval == 0:
+            x = x - alpha * lambda_reg * \
+                torch.autograd.grad(total_variation(x), x,
+                                    create_graph=False)[0]
+            x = torch.clamp(x, 0.0, 1.0)
+        elif method == "Tikhonov":
+            x = x - alpha * lambda_reg * \
+                torch.autograd.grad(tikhonov_regularization(
+                    x), x, create_graph=False)[0]
+            x = torch.clamp(x, 0.0, 1.0)
 
-        x_normalized = x / 255.0
-        # TV-регуляризация решает две задачи:
-        # 1. Подавление шумов и артефактов
-        # 2. Сохранение резких границ
+        # Проверка на сходимость по относительной норме разности
+        diff = torch.norm(x - prev_x) / (torch.norm(prev_x) + 1e-8)
+        print(f"{method} итерация {i+1}, Δ = {diff.item():.6f}")
+        if diff < tol:
+            print(f"{method}: Сходимость достигнута на итерации {i+1}.")
+            break
 
-        # Нормализация в [0, 1] (требование denoise_tv_chambolle)
-        # Посмотреть что это за функция и как она работает
-        x_denoised = denoise_tv_chambolle(x_normalized, weight=lambda_tv)
+        prev_x = x.clone()
 
-        # Возвращаем значения в исходный диапазон [0, 255]
-        # и обеспечиваем корректные значения пикселей
-        x = np.clip(x_denoised * 255.0, 0, 255)
+    end = time.time()
 
-    return x
+    result = (x.detach().squeeze().cpu().numpy() * 255.0).astype(np.uint8)
+    if result_dict is not None and key is not None:
+        result_dict[key] = (result, end - start)
+    return result
 
 
 def main():
-    """
-    Основная функция: загрузка данных, деконволюция, сохранение результата
-    """
-    # Параметры по умолчанию
-    input_file = "Test6.png"    # Размытое изображение
-    kernel_file = "psf_kernel_6.png"    # Ядро размытия
-    output_file = "output.bmp"    # Выходной файл
-    noise_level = 0.0001        # Уровень шума (влияет на силу регуляризации)
+    input_file = "Test6.png"
+    kernel_file = "psf_kernel_6_test.png"
+    output_tv = "output_tv.bmp"
+    output_tikhonov = "output_tikhonov.bmp"
+    noise_level = 0.0001
 
-    # Проверка наличия файлов
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"Файл {input_file} не найден")
-    if not os.path.exists(kernel_file):
-        raise FileNotFoundError(f"Файл {kernel_file} не найден")
+    if not os.path.exists(input_file) or not os.path.exists(kernel_file):
+        raise FileNotFoundError("Файл изображения или ядра не найден")
 
-    # Загрузка данных
-    y = load_gray_image(input_file)  # Загрузка размытого изображения
-    k = load_gray_image(kernel_file)  # Загрузка ядра размытия
-    k = normalize_kernel(k)         # Нормализация ядра
+    y = load_gray_image(input_file)
+    k = load_gray_image(kernel_file)
+    k = normalize_kernel(k)
 
-    # Деконволюция с TV-регуляризацией
-    print("Начало процесса деконволюции...")
-    x_restored = deconvolve_tv(
-        y, k,
-        num_iters= 800,               # Количество итераций
-        lambda_tv=(noise_level / 255)  # Параметр регуляризации
-    )
-    print("Деконволюция завершена!")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"Используем устройство: {device}")
 
-    # Сохранение результата
-    cv2.imwrite(output_file, np.uint8(np.clip(x_restored, 0, 255)))
-    print(f"Результат сохранен в {output_file}")
+    results = {}
+
+    # Запуск двух потоков для сравнения методов TV и Тихонова
+    t1 = threading.Thread(target=deconvolve_pytorch, args=(y, k), kwargs={
+        'method': 'TV',
+        'num_iters': 800,
+        'lambda_reg': noise_level,
+        'tol': 2e-3,
+        'device': device,
+        'result_dict': results,
+        'key': 'TV'
+    })
+
+    t2 = threading.Thread(target=deconvolve_pytorch, args=(y, k), kwargs={
+        'method': 'Tikhonov',
+        'num_iters': 800,
+        'lambda_reg': noise_level,
+        'tol': 2e-3,
+        'device': device,
+        'result_dict': results,
+        'key': 'Tikhonov'
+    })
+
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Сохранение результатов
+    cv2.imwrite(output_tv, results['TV'][0])
+    cv2.imwrite(output_tikhonov, results['Tikhonov'][0])
+
+    # Вывод времени выполнения
+    print(f"TV регуляризация: Время = {results['TV'][1]:.2f} сек")
+    print(f"Тихонов регуляризация: Время = {results['Tikhonov'][1]:.2f} сек")
 
 
 if __name__ == "__main__":
-    main()  # Точка входа в программу
+    main()
